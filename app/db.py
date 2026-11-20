@@ -41,6 +41,65 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     visitor_id  TEXT    NOT NULL PRIMARY KEY,
     withdrawn_at TEXT   NOT NULL
 );
+
+-- ---------------------------------------------------------------------------
+-- A/B guided-tour experiment.
+--
+-- These tables are *materialized* state: a group query never re-derives a
+-- visitor's sample from raw events, it reads the rows below. They are kept
+-- in sync inside the same write transaction as the upload/withdrawal that
+-- affects the visitor (see crud.refresh_experiment_sample).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS exposures (
+    visitor_id   TEXT NOT NULL,
+    variant      TEXT NOT NULL CHECK (variant IN ('A', 'B')),
+    exposed_at   TEXT NOT NULL,
+    received_at  TEXT NOT NULL,
+    -- Replaying the exact same exposure report is idempotent.
+    PRIMARY KEY (visitor_id, variant, exposed_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exposures_visitor_time
+    ON exposures (visitor_id, exposed_at);
+
+-- One row per visitor that is eligible for the experiment (i.e. has at
+-- least one exposure and has not withdrawn). ``group_kind`` is A, B, or
+-- 'cross' for visitors exposed to both variants.
+CREATE TABLE IF NOT EXISTS experiment_samples (
+    visitor_id       TEXT    NOT NULL PRIMARY KEY,
+    group_kind       TEXT    NOT NULL CHECK (group_kind IN ('A', 'B', 'cross')),
+    first_exposed_at TEXT    NOT NULL,
+    window_end       TEXT    NOT NULL,
+    view_count       INTEGER NOT NULL,
+    refreshed_at     TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiment_samples_group
+    ON experiment_samples (group_kind, first_exposed_at);
+
+-- Page views opened inside the visitor's 30-minute window, with dwell state.
+-- Rewritten as a whole whenever that visitor's sample is refreshed.
+CREATE TABLE IF NOT EXISTS experiment_sample_views (
+    visitor_id    TEXT    NOT NULL,
+    page_view_id  TEXT    NOT NULL,
+    exhibit_id    TEXT    NOT NULL,
+    opened_at     TEXT    NOT NULL,
+    closed_at     TEXT,
+    dwell_seconds REAL,
+    dwell_known   INTEGER NOT NULL,
+    sequence      INTEGER NOT NULL,
+    PRIMARY KEY (visitor_id, page_view_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiment_views_visitor_seq
+    ON experiment_sample_views (visitor_id, sequence);
+
+-- Materialized cross-group roster ("串组名单"), read directly by queries.
+CREATE TABLE IF NOT EXISTS experiment_cross_group (
+    visitor_id       TEXT NOT NULL PRIMARY KEY,
+    first_exposed_at TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
 """
 
 
@@ -66,7 +125,13 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: str | None = None) -> None:
-    """Create tables and indexes if they do not yet exist."""
+    """Create tables and indexes if they do not yet exist.
+
+    Several uvicorn workers may run this concurrently at startup. DDL is
+    idempotent (``IF NOT EXISTS``); the schema script runs as one write
+    transaction and the busy timeout makes a worker wait for whichever peer
+    holds the lock instead of failing with ``database is locked``.
+    """
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)

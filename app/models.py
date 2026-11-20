@@ -90,7 +90,69 @@ class WithdrawResult(BaseModel):
     # True for the first withdrawal, False on repeated withdrawals (idempotent).
     already_withdrawn: bool
     events_deleted: int
+    # Experiment rows removed in the same transaction.
+    exposures_deleted: int = 0
+    samples_deleted: int = 0
 
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+# ---------------------------------------------------------------------------
+# Experiment (A/B guided-tour comparison) models
+# ---------------------------------------------------------------------------
+class ExperimentVariant(str, Enum):
+    A = "A"
+    B = "B"
+
+
+class ExposureIn(BaseModel):
+    """One exposure report: a visitor saw variant A or B at a UTC instant."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    visitor_id: str = Field(..., min_length=1, description="匿名观众号")
+    variant: ExperimentVariant = Field(..., description="版别：A 或 B")
+    # Same contract as event_time: timezone-aware ISO-8601, normalized to UTC.
+    exposed_at: str = Field(..., min_length=1, description="曝光 UTC 时间（ISO-8601）")
+
+
+class ExposureResult(BaseModel):
+    visitor_id: str
+    variant: ExperimentVariant
+    exposed_at: str
+    # stored = first acceptance; duplicate = identical exposure already stored;
+    # rejected_withdrawn = visitor withdrew consent, nothing was stored.
+    status: Literal["stored", "duplicate", "rejected_withdrawn"]
+    # Group after this report (None when rejected/withdrawn).
+    group: Literal["A", "B", "cross"] | None
+    # True when this report changed the visitor's first exposure time and thus
+    # recomputed the visitor's window/sample.
+    regrouped: bool
+
+
+class ExperimentSample(BaseModel):
+    """A stored experiment sample; queries read this, never recompute it."""
+
+    visitor_id: str
+    group: Literal["A", "B", "cross"]
+    variants: list[ExperimentVariant]
+    first_exposed_at: str
+    window_end: str
+    views: list[Visit]
+    view_count: int
+
+
+class ExperimentGroups(BaseModel):
+    window_minutes: int
+    # Group -> stored samples. "cross" contains visitors exposed to both.
+    groups: dict[str, list[ExperimentSample]]
+    counts: dict[str, int]
+    # Materialized cross-group roster (visitor ids only).
+    cross_group: list[str]
+
+
+class CrossGroup(BaseModel):
+    total: int
+    visitors: list[str]

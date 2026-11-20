@@ -1,18 +1,24 @@
-"""FastAPI application: event ingestion, visit-path queries, withdrawal."""
+"""FastAPI application: event ingestion, visit-path queries, withdrawal,
+and A/B experiment grouping."""
 from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 
 from . import crud
 from .db import get_connection, init_db, write_transaction
 from .models import (
+    CrossGroup,
     ErrorResponse,
     EventBatchIn,
     EventIn,
+    ExperimentGroups,
+    ExperimentSample,
+    ExposureIn,
+    ExposureResult,
     IngestBatchResult,
     IngestResult,
     VisitPath,
@@ -32,9 +38,10 @@ app = FastAPI(
     title="线上展馆观众参观路径 API",
     description=(
         "从浏览器 open/close 事件还原观众实际参观路径。"
-        "支持事件重传去重、乱序补报、缺关闭标记停留未知，以及数据同意撤回。"
+        "支持事件重传去重、乱序补报、缺关闭标记停留未知，以及数据同意撤回；"
+        "并提供 A/B 线上导览试验的分组、串组与窗内浏览查询。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -139,3 +146,83 @@ def post_withdraw(
 @app.get("/health", summary="健康检查")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# A/B experiment endpoints
+# ---------------------------------------------------------------------------
+@app.post(
+    "/experiment/exposures",
+    response_model=ExposureResult,
+    status_code=status.HTTP_201_CREATED,
+    responses={400: {"model": ErrorResponse}},
+    summary="上报匿名观众曝光的版别与 UTC 时间（按最早曝光重新入组）",
+)
+def post_exposure(
+    exposure: ExposureIn,
+    conn: sqlite3.Connection = Depends(get_connection),
+) -> ExposureResult:
+    """同一 (观众, 版别, 曝光时间) 重传幂等返回 duplicate。
+
+    每次新曝光后只重算该观众的分组样本：若新曝光更早，30 分钟窗口起点随之前移，
+    组别与窗内浏览项随之刷新。撤回观众的曝光不入库。
+    """
+    with write_transaction(conn):
+        return crud.ingest_exposure(conn, exposure)
+
+
+@app.get(
+    "/experiment/groups",
+    response_model=ExperimentGroups,
+    summary="查询已存的分组样本与串组名单",
+)
+def get_experiment_groups(
+    group: str | None = Query(
+        default=None,
+        description="可选：仅返回该组样本（A / B / cross），计数与串组名单仍完整",
+    ),
+    conn: sqlite3.Connection = Depends(get_connection),
+) -> ExperimentGroups:
+    """直接读取物化的分组样本表与串组名单表，不在查询时重算事件配对。"""
+    if group is not None and group not in ("A", "B", "cross"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="group 只能是 A、B 或 cross",
+        )
+    return crud.get_experiment_groups(conn, group)
+
+
+@app.get(
+    "/experiment/cross-group",
+    response_model=CrossGroup,
+    summary="查询串组名单（两版都看过的观众）",
+)
+def get_cross_group(
+    conn: sqlite3.Connection = Depends(get_connection),
+) -> CrossGroup:
+    result = crud.get_experiment_groups(conn)
+    return CrossGroup(total=result.counts["cross"], visitors=result.cross_group)
+
+
+@app.get(
+    "/experiment/visitors/{visitor_id}",
+    response_model=ExperimentSample,
+    responses={404: {"model": ErrorResponse}},
+    summary="查询单个观众的已存试验分组结果（撤回后不可查）",
+)
+def get_experiment_visitor(
+    visitor_id: str,
+    conn: sqlite3.Connection = Depends(get_connection),
+) -> ExperimentSample:
+    """读取该观众已存的分组样本。
+
+    从未曝光、尚未入组或已撤回的观众均返回 404：撤回后既查不到分组，
+    也查不到窗内浏览项，且后续补传不会恢复。
+    """
+    sample = crud.get_experiment_sample(conn, visitor_id)
+    if sample is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="未找到该观众的试验分组结果（未入组或已撤回）",
+        )
+    return sample
